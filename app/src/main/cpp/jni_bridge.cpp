@@ -18,6 +18,25 @@
 static JavaVM *g_jvm = nullptr;
 static jobject g_callback = nullptr;
 
+// Cancel plumbing: whisper_full's progress_callback is polled from the
+// inference thread; it asks the Kotlin callback (shouldCancel()Z) so a
+// cancelled WorkManager job aborts inference mid-chunk instead of chewing
+// up to 10 minutes of audio after cancellation.
+static jmethodID g_should_cancel_mid = nullptr;
+
+// Cancel plumbing (аудит F6): в этом форке whisper progress_callback — void,
+// а штатный способ прервать whisper_full — encoder_begin_callback==false.
+// Опрашиваем Kotlin shouldCancel() на границе каждого 30-сек окна энкодера.
+static bool whisper_encoder_begin_cb(whisper_context * /*ctx*/, whisper_state * /*state*/,
+                                     void * /*user_data*/) {
+    if (!g_callback || !g_should_cancel_mid) return true;
+    JNIEnv *env = nullptr;
+    if (g_jvm->GetEnv((void **) &env, JNI_VERSION_1_6) != JNI_OK || !env) return true;
+    jboolean cancel = env->CallBooleanMethod(g_callback, g_should_cancel_mid);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return true; }
+    return !cancel;
+}
+
 extern "C" {
 
 JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *) {
@@ -129,6 +148,12 @@ Java_ru_mytolm_aidictaphone_voice_WhisperNative_transcribeChunkNative(
     if (!pcm) return -2;
 
     g_callback = callback ? env->NewGlobalRef(callback) : nullptr;
+    g_should_cancel_mid = nullptr;
+    if (g_callback) {
+        jclass ccls = env->GetObjectClass(g_callback);
+        g_should_cancel_mid = env->GetMethodID(ccls, "shouldCancel", "()Z");
+        env->DeleteLocalRef(ccls);
+    }
 
     whisper_full_params wp = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
     wp.print_progress = false;
@@ -139,6 +164,8 @@ Java_ru_mytolm_aidictaphone_voice_WhisperNative_transcribeChunkNative(
     wp.no_context = true;
     wp.token_timestamps = false;
     wp.n_threads = threads > 0 ? threads : 4;
+    // false из encoder_begin_callback штатно прерывает инференс (F6)
+    wp.encoder_begin_callback = whisper_encoder_begin_cb;
 
     const char *lang = env->GetStringUTFChars(language, nullptr);
     wp.language = (lang && lang[0]) ? lang : "auto";
@@ -164,7 +191,7 @@ Java_ru_mytolm_aidictaphone_voice_WhisperNative_transcribeChunkNative(
         if (cenv) {
             jclass cls = cenv->GetObjectClass(g_callback);
             jmethodID segMid = cenv->GetMethodID(cls, "onSegment",
-                                                 "(JLjava/lang/String;)V");
+                                                 "(JJLjava/lang/String;)V");
             int cnt = whisper_full_n_segments(ctx);
             for (int i = 0; i < cnt; i++) {
                 int64_t t0 = whisper_full_get_segment_t0(ctx, i); // csec
@@ -174,12 +201,12 @@ Java_ru_mytolm_aidictaphone_voice_WhisperNative_transcribeChunkNative(
                 // clamp to chunk bounds; segments at chunk start (t0==0) belong
                 // to the overlap region and are merged/deduped on the Kotlin side
                 int64_t ms0 = start_offset_ms + t0 * 10;
-                int64_t ms1 = start_offset_ms + t1 * 10;
+                int64_t ms1 = start_offset_ms + t1 * 10;   // реальный конец (F7)
                 jstring jtxt = cenv->NewStringUTF(txt);
-                if (segMid) cenv->CallVoidMethod(g_callback, segMid, (jlong) ms0, jtxt);
+                if (segMid) cenv->CallVoidMethod(g_callback, segMid,
+                                                 (jlong) ms0, (jlong) ms1, jtxt);
                 if (cenv->ExceptionCheck()) cenv->ExceptionClear();
                 cenv->DeleteLocalRef(jtxt);
-                (void) ms1;
             }
             cenv->DeleteLocalRef(cls);
         }

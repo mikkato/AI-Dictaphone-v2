@@ -9,7 +9,10 @@ package ru.mytolm.aidictaphone.voice
 object WhisperNative {
 
     interface SegmentCallback {
-        fun onSegment(startMs: Long, text: String)
+        /** startMs/endMs — абсолютные (с учётом offset чанка) границы сегмента. */
+        fun onSegment(startMs: Long, endMs: Long, text: String)
+        /** Опрашивается из whisper progress_callback: true → инференс прерывается. */
+        fun shouldCancel(): Boolean = false
     }
 
     @Volatile

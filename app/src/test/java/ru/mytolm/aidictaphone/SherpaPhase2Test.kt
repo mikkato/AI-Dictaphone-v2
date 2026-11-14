@@ -69,18 +69,21 @@ class SherpaPhase2Test {
         val ts = floatArrayOf(0.5f, 1.2f, 3.0f, 4.1f)
         val segs = SherpaPlan.groupSentences(toks, ts, offsetMs = 10_000L)
         assertEquals(2, segs.size)
-        assertEquals(10_500L, segs[0].first)
-        assertEquals("Привет мир.", segs[0].second)
-        assertEquals(13_000L, segs[1].first)
-        assertEquals("Как дела?", segs[1].second)
+        assertEquals(10_500L, segs[0].startMs)
+        assertEquals(11_200L, segs[0].endMs)   // конец = таймстамп последнего токена
+        assertEquals("Привет мир.", segs[0].text)
+        assertEquals(13_000L, segs[1].startMs)
+        assertEquals(14_100L, segs[1].endMs)
+        assertEquals("Как дела?", segs[1].text)
     }
 
     @Test
     fun `group sentences keeps dangling tail`() {
         val segs = SherpaPlan.groupSentences(arrayOf(" хвост"), floatArrayOf(2.0f), 5_000L)
         assertEquals(1, segs.size)
-        assertEquals(7_000L, segs[0].first)
-        assertEquals("хвост", segs[0].second)
+        assertEquals(7_000L, segs[0].startMs)
+        assertEquals(7_001L, segs[0].endMs)    // endMs >= startMs+1
+        assertEquals("хвост", segs[0].text)
     }
 
     @Test

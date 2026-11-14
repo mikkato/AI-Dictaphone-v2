@@ -99,6 +99,63 @@ object WavParser {
     }
 
     /**
+     * Разобранный RIFF-заголовок WAV: всё, что нужно потокому читателю окон.
+     */
+    data class WavFileInfo(
+        val audioFormat: Int, val channels: Int, val sampleRate: Int, val bits: Int,
+        val dataOffset: Long, val dataLen: Long,
+    ) {
+        val bytesPerSample: Int get() = bits / 8
+        val bytesPerFrame: Int get() = bytesPerSample * channels
+        val frameCount: Long get() = if (bytesPerFrame > 0) dataLen / bytesPerFrame else 0L
+    }
+
+    /** Заголовок WAV (RIFF/fmt/data) с валидацией — общий для parseFile и WavPcmSource. */
+    fun parseFileHeader(file: File, raf: java.io.RandomAccessFile): WavFileInfo {
+        val head = ByteArray(minOf(44, file.length().toInt()))
+        if (head.size < 44) throw WavFormatException("Файл слишком мал для WAV")
+        raf.seek(0); raf.readFully(head)
+        if (String(head, 0, 4) != "RIFF" || String(head, 8, 4) != "WAVE")
+            throw WavFormatException("Это не WAV (нет RIFF/WAVE заголовка)")
+
+        var pos = 12L
+        var audioFormat = 0; var channels = 0; var sampleRate = 0; var bits = 0
+        var dataOffset = -1L; var dataLen = 0L
+        while (pos + 8 <= file.length()) {
+            val idBuf = ByteArray(8)
+            raf.seek(pos); raf.readFully(idBuf)
+            val id = String(idBuf, 0, 4)
+            val size = (ByteBuffer.wrap(idBuf, 4, 4).order(ByteOrder.LITTLE_ENDIAN)
+                .getInt().toLong()) and 0xFFFFFFFFL
+            when (id) {
+                "fmt " -> {
+                    val f = ByteArray(minOf(size, 40L).toInt())
+                    raf.seek(pos + 8); raf.readFully(f)
+                    val fb = ByteBuffer.wrap(f).order(ByteOrder.LITTLE_ENDIAN)
+                    audioFormat = fb.getShort(0).toInt() and 0xFFFF
+                    channels = fb.getShort(2).toInt() and 0xFFFF
+                    sampleRate = fb.getInt(4)
+                    bits = fb.getShort(14).toInt() and 0xFFFF
+                }
+                "data" -> { dataOffset = pos + 8; dataLen = minOf(size, file.length() - pos - 8) }
+            }
+            pos += 8 + size + (size and 1)
+        }
+        if (audioFormat == 0) throw WavFormatException("В WAV нет секции fmt")
+        if (dataOffset < 0) throw WavFormatException("В WAV нет секции data")
+        if (channels < 1 || channels > 8) throw WavFormatException("Каналов: $channels — не поддерживается")
+        if (audioFormat != 1 && audioFormat != 3)
+            throw WavFormatException(
+                "Кодек WAV $audioFormat не поддерживается (нужен PCM 16/24-бит или float32). " +
+                "Сконвертируйте файл в WAV PCM.")
+        val bps = bits / 8
+        if (bps !in intArrayOf(1, 2, 3, 4) || (audioFormat == 3 && bits != 32))
+            throw WavFormatException("Разрядность $bits не поддерживается")
+        if (sampleRate <= 0) throw WavFormatException("Некорректная частота дискретизации")
+        return WavFileInfo(audioFormat, channels, sampleRate, bits, dataOffset, dataLen)
+    }
+
+    /**
      * Потоковый разбор WAV без загрузки файла целиком (защита от OOM на длинных
      * импортах: час стерео 48 кГц 16 бит ≈ 700 МБ, readBytes() упал бы дважды).
      * Окна ~2 МБ, линейный ресемплинг с сохранением дробной позиции между окнами —
@@ -107,48 +164,14 @@ object WavParser {
     fun parseFile(file: File): WavData {
         val raf = java.io.RandomAccessFile(file, "r")
         try {
-            val head = ByteArray(minOf(44, file.length().toInt()))
-            if (head.size < 44) throw WavFormatException("Файл слишком мал для WAV")
-            raf.readFully(head)
-            if (String(head, 0, 4) != "RIFF" || String(head, 8, 4) != "WAVE")
-                throw WavFormatException("Это не WAV (нет RIFF/WAVE заголовка)")
-
-            var pos = 12L
-            var audioFormat = 0; var channels = 0; var sampleRate = 0; var bits = 0
-            var dataOffset = -1L; var dataLen = 0L
-            while (pos + 8 <= file.length()) {
-                val idBuf = ByteArray(8)
-                raf.seek(pos); raf.readFully(idBuf)
-                val id = String(idBuf, 0, 4)
-                val size = (ByteBuffer.wrap(idBuf, 4, 4).order(ByteOrder.LITTLE_ENDIAN)
-                    .getInt().toLong()) and 0xFFFFFFFFL
-                when (id) {
-                    "fmt " -> {
-                        val f = ByteArray(minOf(size, 40L).toInt())
-                        raf.seek(pos + 8); raf.readFully(f)
-                        val fb = ByteBuffer.wrap(f).order(ByteOrder.LITTLE_ENDIAN)
-                        audioFormat = fb.getShort(0).toInt() and 0xFFFF
-                        channels = fb.getShort(2).toInt() and 0xFFFF
-                        sampleRate = fb.getInt(4)
-                        bits = fb.getShort(14).toInt() and 0xFFFF
-                    }
-                    "data" -> { dataOffset = pos + 8; dataLen = minOf(size, file.length() - pos - 8) }
-                }
-                pos += 8 + size + (size and 1)
-            }
-            if (audioFormat == 0) throw WavFormatException("В WAV нет секции fmt")
-            if (dataOffset < 0) throw WavFormatException("В WAV нет секции data")
-            if (channels < 1 || channels > 8) throw WavFormatException("Каналов: $channels — не поддерживается")
-            if (audioFormat != 1 && audioFormat != 3)
-                throw WavFormatException(
-                    "Кодек WAV $audioFormat не поддерживается (нужен PCM 16/24-бит или float32). " +
-                    "Сконвертируйте файл в WAV PCM.")
-            val bps = bits / 8
-            if (bps !in intArrayOf(1, 2, 3, 4) || (audioFormat == 3 && bits != 32))
-                throw WavFormatException("Разрядность $bits не поддерживается")
-            val frameCount = (dataLen / (bps * channels)).toInt()
-            val bytesPerFrame = bps * channels
-            if (frameCount == 0 || sampleRate <= 0) return WavData(TARGET_RATE, 1, FloatArray(0))
+            val info = parseFileHeader(file, raf)
+            val channels = info.channels; val sampleRate = info.sampleRate
+            val bits = info.bits; val audioFormat = info.audioFormat
+            val bps = info.bytesPerSample
+            val dataOffset = info.dataOffset
+            val frameCount = info.frameCount.toInt()
+            val bytesPerFrame = info.bytesPerFrame
+            if (frameCount == 0) return WavData(TARGET_RATE, 1, FloatArray(0))
 
             val windowFrames = maxOf(2 * 1048576 / bytesPerFrame, 4096)
             val outCap = (frameCount.toLong() * TARGET_RATE / sampleRate).toInt() + 1

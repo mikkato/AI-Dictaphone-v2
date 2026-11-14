@@ -89,14 +89,14 @@ object SherpaEngine {
     }
 
     /**
-     * Распознавание куска PCM16 16 кГц. Возвращает [абсолютный startMs, текст] —
-     * разбивка по предложениям через таймстампы токенов (если движок их отдаёт),
-     * иначе один сегмент на кусок.
+     * Распознавание куска PCM16 16 кГц. Возвращает сегменты с абсолютными
+     * startMs/endMs — разбивка по предложениям через таймстампы токенов
+     * (если движок их отдаёт), иначе один сегмент на кусок.
      */
     fun recognize(
         context: Context, kind: String, dir: File, pcm: FloatArray,
         threads: Int, offsetMs: Long,
-    ): List<Pair<Long, String>> {
+    ): List<ChunkPlanner.SegmentTriple> {
         val rec = recognizerFor(context, kind, dir, threads)
         val stream = rec.createStream()
         try {
@@ -107,8 +107,11 @@ object SherpaEngine {
             if (text.isEmpty()) return emptyList()
             val toks = res.tokens
             val ts = res.timestamps
-            if (toks.isEmpty() || ts.isEmpty() || ts.size != toks.size)
-                return listOf(Pair(offsetMs, text))
+            if (toks.isEmpty() || ts.isEmpty() || ts.size != toks.size) {
+                val durMs = pcm.size * 1000L / 16000
+                return listOf(ChunkPlanner.SegmentTriple(
+                    offsetMs, offsetMs + durMs.coerceAtLeast(1), text))
+            }
             return SherpaPlan.groupSentences(toks, ts, offsetMs)
         } finally {
             stream.release()
@@ -126,23 +129,33 @@ object SherpaPlan {
 
     private val SENTENCE_ENDERS = charArrayOf('.', '!', '?', ';')
 
-    /** Токены -> предложения по концам . ! ? ; с абсолютными метками времени. */
-    fun groupSentences(toks: Array<String>, ts: FloatArray, offsetMs: Long): List<Pair<Long, String>> {
-        val out = ArrayList<Pair<Long, String>>()
+    /** Токены -> предложения по концам . ! ? ; с абсолютными startMs/endMs. */
+    fun groupSentences(
+        toks: Array<String>, ts: FloatArray, offsetMs: Long,
+    ): List<ChunkPlanner.SegmentTriple> {
+        val out = ArrayList<ChunkPlanner.SegmentTriple>()
         val cur = StringBuilder()
         var startMs = offsetMs
+        var lastMs = offsetMs
         var has = false
         for ((i, t) in toks.withIndex()) {
-            if (!has) { startMs = offsetMs + (ts[i] * 1000).toLong(); has = true }
+            val ms = offsetMs + (ts[i] * 1000).toLong()
+            if (!has) { startMs = ms; has = true }
+            lastMs = ms
             cur.append(t)
             val tr = t.trim()
             if (tr.isNotEmpty() && tr.last() in SENTENCE_ENDERS) {
                 val str = cur.toString().replace("  ", " ").trim()
-                if (str.isNotEmpty()) out.add(Pair(startMs, str))
+                if (str.isNotEmpty())
+                    out.add(ChunkPlanner.SegmentTriple(
+                        startMs, maxOf(lastMs, startMs + 1), str))
                 cur.setLength(0); has = false
             }
         }
-        if (cur.isNotBlank()) out.add(Pair(startMs, cur.toString().replace("  ", " ").trim()))
+        if (cur.isNotBlank())
+            out.add(ChunkPlanner.SegmentTriple(
+                startMs, maxOf(lastMs, startMs + 1),
+                cur.toString().replace("  ", " ").trim()))
         return out
     }
 

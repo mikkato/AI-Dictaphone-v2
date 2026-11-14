@@ -93,20 +93,24 @@ class CoreTests {
         )
         // новый чанк начинается с 598000; сегмент 598500 — дубль из перекрытия
         val out = ChunkPlanner.stitch(accepted, 598_000, listOf(
-            Pair(598_500L, "пять ещё"),
-            Pair(600_200L, "шесть"),
+            ChunkPlanner.SegmentTriple(598_500L, 599_800L, "пять ещё"),
+            ChunkPlanner.SegmentTriple(600_200L, 601_500L, "шесть"),
         ))
         assertEquals(3, out.size)
         assertEquals("пять", out[1].text)
         assertEquals("шесть", out[2].text)
         assertEquals(600_200L, out[2].startMs)
+        // endMs — реальный конец сегмента из движка (F7), не «старт+1»
+        assertEquals(601_500L, out[2].endMs)
     }
 
     @Test fun `stitch first chunk keeps everything`() {
         val out = ChunkPlanner.stitch(emptyList(), 0, listOf(
-            Pair(100L, "а"), Pair(5000L, "б"),
+            ChunkPlanner.SegmentTriple(100L, 4_900L, "а"),
+            ChunkPlanner.SegmentTriple(5000L, 9_500L, "б"),
         ))
         assertEquals(2, out.size)
+        assertEquals(4_900L, out[0].endMs)
     }
 
     // ---------- LLM промпт / map-reduce ----------

@@ -2,17 +2,22 @@ package ru.mytolm.aidictaphone.voice
 
 import android.content.Context
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import ru.mytolm.aidictaphone.data.*
 import ru.mytolm.aidictaphone.util.TimeFmt
 import java.io.File
 import kotlin.math.ceil
 
 /**
- * Пайплайн транскрипции (ТЗ §5): декод → чанки 10 мин (перекрытие 2 с) →
- * whisper_full → сшивка → Room. Прогресс реальный, возобновление с чанка.
+ * Пайплайн транскрипции (ТЗ §5): потоковый декод окнами → чанки 10 мин
+ * (перекрытие 2 с) → whisper_full / sherpa → сшивка → Room. Прогресс реальный,
+ * возобновление с чанка. Декод whole-file в Java-куче удалён (аудит S1):
+ * PCM читается окнами под текущий чанк через [PcmSource].
  * UI-операции не блокируются: вызывается только из фоновых корутин/WorkManager.
  */
 class TranscriptionEngine(
@@ -31,6 +36,8 @@ class TranscriptionEngine(
     interface ProgressListener {
         fun onProgress(noteId: Long, percent: Int) {}
         fun onSegment(noteId: Long, text: String) {}
+        /** Воркер пробрасывает сюда свою остановку (WorkManager isStopped). */
+        fun isCancelled(): Boolean = false
     }
 
     class TranscriptionError(message: String, val needsSmallerModel: Boolean = false) : Exception(message)
@@ -68,37 +75,37 @@ class TranscriptionEngine(
         ctxModel = modelPath
     }
 
-    /** декод mp3/wav → float PCM 16 кГц mono */
-    fun decodeToPcm(file: File): Pair<FloatArray, Long> {
+    /**
+     * Потоковый источник PCM 16 кГц (аудит S1): WAV — по окнам с seeks,
+     * контейнеры — MediaCodec вперёд с удержанием 3 с хвоста. Если ни один
+     * путь не дал длительности — фолбэк whole-file (короткие файлы без
+     * метаданных), как раньше.
+     */
+    private fun openPcmSource(file: File): PcmSource {
         val name = file.name.lowercase()
-        return when {
-            name.endsWith(".wav") -> {
-                val w = WavParser.parseFile(file)   // потоково: без OOM на длинных WAV
-                Pair(w.samples, w.samples.size * 1000L / 16000)
-            }
-            name.endsWith(".mp3") || name.endsWith(".m4a") || name.endsWith(".mp4") ||
-                name.endsWith(".ogg") || name.endsWith(".3gp") || name.endsWith(".aac") ||
-                name.endsWith(".amr") -> {
-                // MediaCodec контейнеры: MP3/AAC(MP4)/OGG — аудио-дорожка выбирается по MIME (§5.1)
+        val looksMedia = name.endsWith(".mp3") || name.endsWith(".m4a") ||
+            name.endsWith(".mp4") || name.endsWith(".ogg") || name.endsWith(".3gp") ||
+            name.endsWith(".aac") || name.endsWith(".amr")
+        fun wav(): PcmSource? = try { WavPcmSource.open(file) } catch (_: Exception) { null }
+        fun media(): PcmSource? = try { Mp3PcmSource.open(file) } catch (_: Exception) { null }
+        val src = if (looksMedia) media() ?: wav() else wav() ?: media()
+        if (src != null) return src
+        // фолбэк: WAV-парсер по всему файлу (короткие файлы без метаданных)
+        val fallback = try {
+            val w = WavParser.parseFile(file)
+            MemoryPcmSource(w.samples)
+        } catch (e: Exception) {
+            try {
                 val d = Mp3Decoder.decode(file)
-                Pair(d.samples, d.durationMs)
-            }
-            else -> {
-                // пробуем как WAV, при неудаче — как MediaCodec-контейнер
-                try {
-                    val w = WavParser.parseFile(file)
-                    Pair(w.samples, w.samples.size * 1000L / 16000)
-                } catch (e: Exception) {
-                    try {
-                        val d = Mp3Decoder.decode(file)
-                        Pair(d.samples, d.durationMs)
-                    } catch (e2: Exception) {
-                        throw TranscriptionError(
-                            "Неподдерживаемый аудиоформат «${file.extension}». Поддерживаются mp3 и wav.")
-                    }
-                }
+                MemoryPcmSource(d.samples)
+            } catch (e2: Exception) {
+                throw TranscriptionError(
+                    "Неподдерживаемый аудиоформат «${file.extension}». Поддерживаются mp3 и wav.")
             }
         }
+        if (fallback.totalSamples == 0L)
+            throw TranscriptionError("Пустое аудио: ${file.name}")
+        return fallback
     }
 
     /**
@@ -119,74 +126,90 @@ class TranscriptionEngine(
             if (!audio.exists())
                 throw TranscriptionError("Аудиофайл потерян: ${audio.name}")
 
-            val (pcm, durationMs) = decodeToPcm(audio)
-            if (note.durationMs != durationMs)
-                dao.updateNote(note.copy(durationMs = durationMs))
+            val source = openPcmSource(audio)
+            val durationMs = source.durationMs
+            try {
+                if (note.durationMs != durationMs)
+                    dao.updateNote(note.copy(durationMs = durationMs))
 
-            val chunks = if (kind == ModelRegistry.KIND_WHISPER) ChunkPlanner.plan(durationMs)
-                         else SherpaPlan.chunkPlan(durationMs)
-            val resumeFromMs = dao.lastSegmentEndMs(noteId) ?: -1L
-            val accepted = dao.segments(noteId).map {
-                ChunkPlanner.AcceptedSegment(it.startMs, it.endMs, it.text)
-            }
+                val chunks = if (kind == ModelRegistry.KIND_WHISPER) ChunkPlanner.plan(durationMs)
+                             else SherpaPlan.chunkPlan(durationMs)
+                val resumeFromMs = dao.lastSegmentEndMs(noteId) ?: -1L
+                val accepted = dao.segments(noteId).map {
+                    ChunkPlanner.AcceptedSegment(it.startMs, it.endMs, it.text)
+                }
 
-            val vocab = settings.customVocabulary
-            val prompt = if (vocab.isEmpty()) null
-                         else "Словарь: " + vocab.joinToString(", ")
+                val vocab = settings.customVocabulary
+                val prompt = if (vocab.isEmpty()) null
+                             else "Словарь: " + vocab.joinToString(", ")
 
-            var stitched = accepted
-            for (chunk in chunks) {
-                if (cancelled) break
-                // возобновление с чанка: пропускаем полностью покрытые segments
-                if (resumeFromMs > 0 && chunk.endMs <= resumeFromMs) continue
+                var stitched = accepted
+                for (chunk in chunks) {
+                    if (cancelled || listener.isCancelled()) { cancelled = true; break }
+                    // возобновление с чанка: пропускаем полностью покрытые segments
+                    if (resumeFromMs > 0 && chunk.endMs <= resumeFromMs) continue
 
-                if (kind == ModelRegistry.KIND_WHISPER) ensureModel(modelPath)
-                val fromMs = maxOf(chunk.startMs,
-                    if (resumeFromMs > 0) resumeFromMs - ChunkPlanner.OVERLAP_MS else chunk.startMs)
-                val startSample = (fromMs * 16).toInt().coerceIn(0, pcm.size)
-                val endSample = (chunk.endMs * 16).toInt().coerceAtMost(pcm.size)
-                if (endSample <= startSample) continue
-                val chunkPcm = pcm.copyOfRange(startSample, endSample)
-                val absOffsetMs = startSample * 1000L / 16000
+                    if (kind == ModelRegistry.KIND_WHISPER) ensureModel(modelPath)
+                    val fromMs = maxOf(chunk.startMs,
+                        if (resumeFromMs > 0) resumeFromMs - ChunkPlanner.OVERLAP_MS else chunk.startMs)
+                    val startSample = (fromMs * 16).coerceIn(0, source.totalSamples)
+                    val endSample = (chunk.endMs * 16).coerceAtMost(source.totalSamples)
+                    if (endSample <= startSample) continue
+                    // окно читается из источника по требованию (аудит S1) —
+                    // пик памяти = один чанк, а не весь файл
+                    val chunkPcm = source.readWindow(startSample, endSample)
+                    val absOffsetMs = startSample * 1000L / 16000
 
-                val raw = ArrayList<Pair<Long, String>>()
-                if (kind == ModelRegistry.KIND_WHISPER) {
-                    val rc = WhisperNative.transcribeChunk(
-                        ctxHandle, chunkPcm, absOffsetMs,
-                        settings.whisperLanguage, settings.inferenceThreads, prompt,
-                        object : WhisperNative.SegmentCallback {
-                            override fun onSegment(startMs: Long, text: String) {
-                                raw.add(Pair(startMs, text))
+                    val raw = ArrayList<ChunkPlanner.SegmentTriple>()
+                    if (kind == ModelRegistry.KIND_WHISPER) {
+                        val rc = WhisperNative.transcribeChunk(
+                            ctxHandle, chunkPcm, absOffsetMs,
+                            settings.whisperLanguage, settings.inferenceThreads, prompt,
+                            object : WhisperNative.SegmentCallback {
+                                override fun onSegment(startMs: Long, endMs: Long, text: String) {
+                                    raw.add(ChunkPlanner.SegmentTriple(startMs, endMs, text))
+                                }
+                                // опрашивается из whisper progress_callback — реальный
+                                // обрыв инференса посреди чанка (аудит F6)
+                                override fun shouldCancel(): Boolean =
+                                    cancelled || listener.isCancelled()
                             }
-                        }
-                    )
-                    if (rc != 0)
-                        throw TranscriptionError("Whisper вернул код ошибки $rc при обработке фрагмента " +
-                            "${TimeFmt.clock(chunk.startMs)}–${TimeFmt.clock(chunk.endMs)}")
-                } else {
-                    raw.addAll(SherpaEngine.recognize(
-                        context, kind, File(modelPath), chunkPcm,
-                        settings.inferenceThreads, absOffsetMs))
-                }
+                        )
+                        if (rc != 0 && !cancelled && !listener.isCancelled())
+                            throw TranscriptionError("Whisper вернул код ошибки $rc при обработке фрагмента " +
+                                "${TimeFmt.clock(chunk.startMs)}–${TimeFmt.clock(chunk.endMs)}")
+                    } else {
+                        raw.addAll(SherpaEngine.recognize(
+                            context, kind, File(modelPath), chunkPcm,
+                            settings.inferenceThreads, absOffsetMs))
+                    }
 
-                // stitch только дописывает хвост (принятые сегменты не меняются) —
-                // в БД уходит новый хвост, а не весь список (раньше: clear+re-insert
-                // всех сегментов на каждый чанк = O(n²) записей на длинных записях)
-                val prevCount = stitched.size
-                stitched = ChunkPlanner.stitch(stitched, absOffsetMs, raw)
-                if (stitched.size > prevCount) {
-                    dao.insertSegments(stitched.drop(prevCount).map {
-                        Segment(noteId = noteId, startMs = it.startMs,
-                            endMs = maxOf(it.endMs, it.startMs + 1), text = it.text)
-                    })
+                    // stitch только дописывает хвост (принятые сегменты не меняются) —
+                    // в БД уходит новый хвост, а не весь список (раньше: clear+re-insert
+                    // всех сегментов на каждый чанк = O(n²) записей на длинных записях)
+                    val prevCount = stitched.size
+                    stitched = ChunkPlanner.stitch(stitched, absOffsetMs, raw)
+                    if (stitched.size > prevCount) {
+                        dao.insertSegments(stitched.drop(prevCount).map {
+                            Segment(noteId = noteId, startMs = it.startMs,
+                                endMs = maxOf(it.endMs, it.startMs + 1), text = it.text)
+                        })
+                    }
+                    val pct = ceil(100.0 * chunk.endMs / durationMs).toInt().coerceIn(0, 100)
+                    dao.setProgress(noteId, pct)
+                    listener.onProgress(noteId, pct)
                 }
-                val pct = ceil(100.0 * chunk.endMs / durationMs).toInt().coerceIn(0, 100)
-                dao.setProgress(noteId, pct)
-                listener.onProgress(noteId, pct)
+            } finally {
+                source.close()
             }
 
-            if (cancelled) {
-                dao.setNoteStatus(noteId, NoteStatus.AUDIO, prog = 0)
+            if (cancelled || listener.isCancelled()) {
+                // мягкая отмена: принятые сегменты остаются, статус — AUDIO, prog=0
+                // (запись в NonCancellable — воркер уже остановлен, обычная корутина упадёт)
+                cancelled = true
+                withContext(NonCancellable) {
+                    dao.setNoteStatus(noteId, NoteStatus.AUDIO, prog = 0)
+                }
                 return
             }
             val segs = dao.segments(noteId)
@@ -194,6 +217,13 @@ class TranscriptionEngine(
                 throw TranscriptionError("Транскрипт пуст — возможно, в аудио нет речи")
             dao.setNoteStatus(noteId, NoteStatus.TRANSCRIPT, prog = 100)
             maybeAutoTitle(noteId, segs)
+        } catch (e: CancellationException) {
+            // воркер отменён во время блокирующего вызова: фиксируем мягкую отмену
+            // в NonCancellable-контексте и пробрасываем дальше
+            withContext(NonCancellable) {
+                dao.setNoteStatus(noteId, NoteStatus.AUDIO, prog = 0)
+            }
+            throw e
         } catch (e: OutOfMemoryError) {
             // §7: OOM → предложить меньшую модель
             dao.setNoteStatus(noteId, NoteStatus.ERROR,
@@ -203,6 +233,9 @@ class TranscriptionEngine(
         } catch (e: Exception) {
             Log.e("TranscriptionEngine", "transcribe failed", e)
             dao.setNoteStatus(noteId, NoteStatus.ERROR, e.message ?: "Внутренняя ошибка")
+        } finally {
+            // резидентная ASR после завершения транскрипции выгрузится по таймауту (S6)
+            ModelManager.scheduleIdleUnload()
         }
     }
 

@@ -33,27 +33,31 @@ object ChunkPlanner {
     /**
      * Сегменты нового чанка добавляются к уже принятым: отбрасываются сегменты,
      * начинающиеся строго раньше конца предыдущего принятого (попадание в зону
-     * перекрытия). Принятые сегменты не изменяются.
+     * перекрытия). Принятые сегменты не изменяются. endMs — реальный конец
+     * сегмента из движка (аудит F7), не «старт+1».
      * Чистая функция — покрыта unit-тестом.
      */
     fun stitch(
         accepted: List<AcceptedSegment>,
         chunkStartMs: Long,
-        newSegments: List<Pair<Long, String>>, // startMs (уже абсоютный), text
+        newSegments: List<SegmentTriple>, // startMs/endMs (абсолютные), text
     ): List<AcceptedSegment> {
         val prevEnd = accepted.maxOfOrNull { it.endMs } ?: chunkStartMs
         val out = ArrayList(accepted)
         var cursor = prevEnd
-        for ((startMs, text) in newSegments) {
-            if (startMs < cursor && text.isBlank()) continue
+        for ((startMs, endMs, text) in newSegments) {
             if (startMs < cursor) continue // дубль из перекрытия
             val t = text.trim()
             if (t.isEmpty()) continue
-            out.add(AcceptedSegment(startMs, maxOf(startMs, cursor), t))
-            cursor = maxOf(cursor, startMs)
+            val end = maxOf(endMs, startMs + 1)
+            out.add(AcceptedSegment(startMs, end, t))
+            cursor = maxOf(cursor, end)
         }
         return out
     }
+
+    /** Сегмент как его вернул движок: начало, конец, текст. */
+    data class SegmentTriple(val startMs: Long, val endMs: Long, val text: String)
 
     data class AcceptedSegment(val startMs: Long, val endMs: Long, val text: String)
 }

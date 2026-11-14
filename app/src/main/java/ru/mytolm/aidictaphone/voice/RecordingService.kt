@@ -45,7 +45,10 @@ class RecordingService : Service() {
         @Volatile var simulate = false
         /** Усиление входа микрофона (0.2..4), применяется к PCM при записи */
         @Volatile var micGain = 1.0f
-        var lastSavedNoteId: Long = -1
+        @Volatile var lastSavedNoteId: Long = -1
+
+        /** Период переписи WAV-заголовка: каждые ~30 с данных (48 кГц mono 16 бит). */
+        private const val HEADER_FLUSH_BYTES = 30L * SR * 2
 
         fun start(context: Context) {
             context.startForegroundService(
@@ -145,15 +148,38 @@ class RecordingService : Service() {
         isPaused = false
         elapsedMs = 0
         pcmBytes = 0
+        lastSavedNoteId = -1
+
+        // Непотеря данных (аудит F5): заметка создаётся в НАЧАЛЕ записи — при крахе
+        // или убийстве процесса пользователь теряет только хвост после последнего
+        // переписанного заголовка, а не запись целиком.
+        App.instance.scope.launch { ensureNote() }
 
         val chan = Channel<ByteArray>(128)   // ~5.5 с буфера — диск не сорвёт захват
         pcmChannel = chan
         writerJob = App.instance.scope.launch {
+            var lastHeaderBytes = 0L
             try {
                 for (chunk in chan) {
                     try { raf?.write(chunk, 0, chunk.size) } catch (e: Exception) { break }
                     pcmBytes += chunk.size
                     elapsedMs = pcmBytes * 1000 / (SR * 2)
+                    // Инкрементальная допись RIFF/data sizes (аудит F5): убийство
+                    // процесса оставляет читаемый WAV длительностью до последних 30 с.
+                    if (pcmBytes - lastHeaderBytes >= HEADER_FLUSH_BYTES) {
+                        lastHeaderBytes = pcmBytes
+                        try {
+                            raf?.let {
+                                it.seek(0); writeWavHeaderTo(it, pcmBytes)
+                                it.seek(44 + pcmBytes)
+                            }
+                        } catch (_: Exception) {}
+                        // заодно живой таймер в нотификации (аудит F9)
+                        try {
+                            getSystemService(android.app.NotificationManager::class.java)
+                                ?.notify(NOTIF_ID, buildNotification())
+                        } catch (_: Exception) {}
+                    }
                 }
             } catch (_: Exception) {}
             finalizeWav()
@@ -243,6 +269,10 @@ class RecordingService : Service() {
         // обрывал этот launch на середине (заметка оставалась AUDIO или без постановки
         // транскрипции в очередь). Используем глобальный scope приложения — он не гасится.
         val writer = writerJob
+        // id заметки захватываем синхронно: новая запись может начаться раньше,
+        // чем отработает этот launch (companion-флаг к тому моменту уже другой)
+        val capturedNoteId = lastSavedNoteId
+        lastSavedNoteId = -1
         App.instance.scope.launch {
             // ждём слив буфера с диска (без этого durMs и заголовок могли сниматься
             // по недовычисленному pcmBytes — обрезанная заметка на ровном месте)
@@ -251,12 +281,12 @@ class RecordingService : Service() {
             val durMs = pcmBytes * 1000 / (SR * 2)
             elapsedMs = durMs
             val dao = App.instance.dao
-            if (lastSavedNoteId > 0) {
-                dao.note(lastSavedNoteId)?.let {
+            if (capturedNoteId > 0) {
+                dao.note(capturedNoteId)?.let {
                     dao.updateNote(it.copy(audioPath = outFile?.absolutePath ?: it.audioPath,
                         durationMs = durMs, status = ru.mytolm.aidictaphone.data.NoteStatus.QUEUED))
                 }
-                lastSavedNoteId.let { TranscriptionWorker.schedule(applicationContext, it) }
+                TranscriptionWorker.schedule(applicationContext, capturedNoteId)
             } else if (durMs > 500) {
                 val id = ensureNote()
                 dao.note(id)?.let {
@@ -264,7 +294,6 @@ class RecordingService : Service() {
                 }
                 TranscriptionWorker.schedule(applicationContext, id)
             }
-            lastSavedNoteId = -1
         }
         stopForeground(STOP_FOREGROUND_REMOVE)
     }

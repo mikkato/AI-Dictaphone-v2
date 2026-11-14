@@ -18,6 +18,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -73,8 +75,9 @@ fun MemInformer(modifier: Modifier = Modifier) {
             tonalElevation = 3.dp,
             shadowElevation = 6.dp,
             modifier = modifier
-                .size(40.dp)
-                .clickable { collapsed = false },
+                .size(48.dp)
+                .clickable { collapsed = false }
+                .semantics { contentDescription = "Монитор моделей: $stateText, развернуть" },
         ) {
             Box(contentAlignment = Alignment.Center) {
                 Text("●", color = dotColor, fontSize = 14.sp)
@@ -110,7 +113,7 @@ fun MemInformer(modifier: Modifier = Modifier) {
                     maxLines = 1)
                 // стрелка вправо — свернуть до иконки
                 Box(
-                    Modifier.size(30.dp).clip(CircleShape)
+                    Modifier.size(48.dp).clip(CircleShape)
                         .clickable { collapsed = true },
                     contentAlignment = Alignment.Center) {
                     Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, "Свернуть",

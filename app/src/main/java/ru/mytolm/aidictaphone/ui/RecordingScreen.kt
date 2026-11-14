@@ -32,6 +32,8 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
@@ -130,6 +132,9 @@ fun RecordingScreen(onDone: () -> Unit) {
                 onValueChange = { gain = it; RecordingService.micGain = it },
                 valueRange = 0.2f..4f,
                 steps = 18,
+                modifier = Modifier.semantics {
+                    contentDescription = "Чувствительность микрофона, ×%.1f".format(gain)
+                },
             )
 
             Spacer(Modifier.height(8.dp))

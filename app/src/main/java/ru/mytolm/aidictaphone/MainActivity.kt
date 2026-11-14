@@ -3,7 +3,9 @@ package ru.mytolm.aidictaphone
 import android.Manifest
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
@@ -12,6 +14,8 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.dynamicDarkColorScheme
+import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.SideEffect
@@ -21,6 +25,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
@@ -74,6 +79,7 @@ private val PlaudDark = darkColorScheme(
 fun DictaphoneTheme(content: @Composable () -> Unit) {
     // "system" | "light" | "dark" (Настройки → Оформление)
     val mode by App.instance.settings.theme.collectAsState(initial = "system")
+    val dynamic by App.instance.settings.dynamicTheme.collectAsState(initial = true)
     val dark = when (mode) {
         "light" -> false
         "dark" -> true
@@ -81,6 +87,7 @@ fun DictaphoneTheme(content: @Composable () -> Unit) {
     }
     // иконки/текст статус-бара — контрастные к выбранной теме
     val view = LocalView.current
+    val context = LocalContext.current
     if (!view.isInEditMode) {
         SideEffect {
             val window = (view.context as android.app.Activity).window
@@ -89,8 +96,17 @@ fun DictaphoneTheme(content: @Composable () -> Unit) {
         }
     }
 
+    // Material You (аудит UX-1): раскраска из обоев, тумблер в настройках;
+    // dynamicColorScheme кидает исключение без Material You — откат на бренд-палитру
+    val brand = if (dark) PlaudDark else PlaudLight
+    val scheme = if (dynamic && !view.isInEditMode) {
+        try {
+            if (dark) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
+        } catch (_: Exception) { brand }
+    } else brand
+
     MaterialTheme(
-        colorScheme = if (dark) PlaudDark else PlaudLight,
+        colorScheme = scheme,
         content = content,
     )
 }
@@ -102,6 +118,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // edge-to-edge (аудит UX-1): на minSdk 35 включено системой по умолчанию,
+        // вызов делает поведение явным и одинаковым; отступы дают Scaffold/insets
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.auto(
+                android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.auto(
+                android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT),
+        )
         val perms = mutableListOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS)
         notifPermission.launch(perms.toTypedArray())
 

@@ -15,6 +15,10 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -48,8 +52,6 @@ fun SettingsScreen(onBack: () -> Unit, onModels: () -> Unit) {
     var language by remember { mutableStateOf(settings.whisperLanguage) }
     var vocab by remember { mutableStateOf(settings.customVocabulary.joinToString("\n")) }
     var threads by remember { mutableIntStateOf(settings.inferenceThreads) }
-    var diarization by remember { mutableStateOf(settings.diarizationEnabled) }
-    var speakers by remember { mutableIntStateOf(settings.expectedSpeakers) }
 
     var langMenu by remember { mutableStateOf(false) }
 
@@ -113,7 +115,10 @@ fun SettingsScreen(onBack: () -> Unit, onModels: () -> Unit) {
                 Column(Modifier.weight(1f)) {
                     Text("temperature = %.1f".format(temperature), fontSize = 13.sp)
                     Slider(temperature, { temperature = it },
-                        valueRange = 0f..1f, steps = 19)
+                        valueRange = 0f..1f, steps = 19,
+                        modifier = Modifier.semantics {
+                            contentDescription = "Температура генерации, %.1f".format(temperature)
+                        })
                 }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -244,13 +249,17 @@ fun SettingsScreen(onBack: () -> Unit, onModels: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text("Потонов inference: $threads", fontSize = 13.sp)
             Slider(threads.toFloat(), { threads = it.toInt() },
-                valueRange = 2f..16f, steps = 13)
+                valueRange = 2f..16f, steps = 13,
+                modifier = Modifier.semantics {
+                    contentDescription = "Потонов inference: $threads"
+                })
 
             HorizontalDivider(Modifier.padding(vertical = 8.dp))
 
             // ---------- Оформление ----------
             SectionTitle("Оформление")
             val themeMode by settings.theme.collectAsState()
+            val dynTheme by settings.dynamicTheme.collectAsState()
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 val opts = listOf("system" to "Как в системе", "light" to "Светлая", "dark" to "Тёмная")
                 opts.forEach { (v, label) ->
@@ -260,26 +269,23 @@ fun SettingsScreen(onBack: () -> Unit, onModels: () -> Unit) {
                         OutlinedButton(onClick = { settings.saveTheme(v) }) { Text(label) }
                 }
             }
+            Spacer(Modifier.height(6.dp))
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Material You", fontSize = 14.sp)
+                    Text("Брать цвета оформления из обоев системы. " +
+                         "Выключите для фирменной палитры.",
+                        fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Switch(dynTheme, { settings.saveDynamicTheme(it) },
+                    modifier = Modifier.semantics { stateDescription = if (dynTheme) "включено" else "выключено" })
+            }
             Text("Тема применяется сразу, выбирается на всех экранах.", fontSize = 11.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
 
-            HorizontalDivider(Modifier.padding(vertical = 8.dp))
-
-            // ---------- Диаризация ----------
-            SectionTitle("Диаризация спикеров")
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Switch(diarization, {
-                    diarization = it
-                    settings.diarizationEnabled = it
-                })
-                Spacer(Modifier.width(10.dp))
-                Text("Определять спикеров (sherpa-onnx)", fontSize = 14.sp)
-            }
-            if (diarization) {
-                Text("Ожидаемое число спикеров: $speakers", fontSize = 13.sp)
-                Slider(speakers.toFloat(), { speakers = it.toInt() },
-                    valueRange = 2f..6f, steps = 3)
-            }
+            // Секция «Диаризация спикеров» убрана (аудит F17): переключатель и слайдер
+            // нигде не использовались — фиктивный контроль. Схема Segment под будущую
+            // диаризацию сохранена; секцию вернём вместе с реальной реализацией.
 
             HorizontalDivider(Modifier.padding(vertical = 8.dp))
 
@@ -322,16 +328,17 @@ private fun save(
 @Composable
 private fun LocalLlmSection() {
     val settings = App.instance.settings
-    val scope = rememberCoroutineScope()
-    val progress = remember { mutableStateMapOf<String, Int>() }
-    val busy = remember { mutableStateMapOf<String, Boolean>() }
-    val errors = remember { mutableStateMapOf<String, String>() }
+    val context = LocalContext.current
+    val dl by ru.mytolm.aidictaphone.voice.ModelDownloads.state(context)
+        .collectAsState()
+    val tapped = remember { mutableStateMapOf<String, Boolean>() }
     var refresh by remember { mutableIntStateOf(0) }
     val selectedId = settings.localLlmId
 
     Text("Малые multilingual-модели (GGUF, llama.cpp). Одновременно с моделью распознавания " +
          "в памяти держится только одна: при суммаризации ASR выгружается, при распознавании — " +
-         "LLM. Текущий режим и RAM — на плавающей плашке внизу экрана.",
+         "LLM. Текущий режим и RAM — на плавающей плашке внизу экрана. Скачивание идёт в фоне " +
+         "и продолжается после закрытия экрана.",
         fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
     Spacer(Modifier.height(8.dp))
 
@@ -353,38 +360,36 @@ private fun LocalLlmSection() {
                 }
                 val m = sel
                 val installed = App.instance.downloader.installedLlm(m)
-                if (busy[m.id] == true) {
+                if (installed) tapped.remove(m.id)
+                val st = dl[m.id]
+                val busy = st?.running == true ||
+                    (tapped[m.id] == true && !installed && st?.error == null)
+                if (busy) {
                     Spacer(Modifier.height(8.dp))
-                    LinearProgressIndicator(progress = { (progress[m.id] ?: 0) / 100f },
+                    LinearProgressIndicator(progress = { (st?.percent ?: 0) / 100f },
                         modifier = Modifier.fillMaxWidth())
-                    Text("${progress[m.id] ?: 0}% — возобновляется после обрыва",
+                    Text("${st?.percent ?: 0}% — возобновляется после обрыва",
                         fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                errors[m.id]?.let {
+                if (!busy && st?.error != null) {
                     Spacer(Modifier.height(4.dp))
-                    Text(it, fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
+                    Text(st.error, fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
                 }
                 Spacer(Modifier.height(8.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically) {
-                    if (!installed && busy[m.id] != true) {
+                    if (!installed && busy) {
+                        OutlinedButton(onClick = {
+                            tapped.remove(m.id)
+                            ru.mytolm.aidictaphone.voice.ModelDownloadWorker
+                                .cancel(context, m.id)
+                        }) { Text("Отменить") }
+                    }
+                    if (!installed && !busy) {
                         Button(onClick = {
-                            busy[m.id] = true; errors.remove(m.id)
-                            scope.launch {
-                                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                                    App.instance.downloader.downloadLlm(m) { ev ->
-                                        when (ev) {
-                                            is ru.mytolm.aidictaphone.data.DownloadEvent.Progress ->
-                                                progress[m.id] = if (ev.total > 0)
-                                                    (100.0 * ev.downloaded / ev.total).toInt() else 0
-                                            is ru.mytolm.aidictaphone.data.DownloadEvent.Failed ->
-                                                errors[m.id] = ev.message
-                                            else -> {}
-                                        }
-                                    }
-                                }.onFailure { errors[m.id] = it.message ?: "Ошибка загрузки" }
-                                busy[m.id] = false; refresh++
-                            }
+                            tapped[m.id] = true
+                            ru.mytolm.aidictaphone.voice.ModelDownloadWorker
+                                .enqueue(context, m.id, isLlm = true, urlBase = null)
                         }) { Text("Скачать ${m.label.split("·").last().trim()}") }
                     }
                     if (installed) {
@@ -395,13 +400,14 @@ private fun LocalLlmSection() {
                                 Text("Использовать")
                             }
                         OutlinedIconButton(onClick = {
-                            scope.launch(kotlinx.coroutines.Dispatchers.IO) {
-                                java.io.File(App.instance.downloader.modelsDir(), m.fileName)
-                                    .delete()
-                                if (settings.localLlmId == m.id) settings.localLlmId = null
-                                refresh++
-                            }
-                        }) { Icon(Icons.Filled.Delete, "Удалить") }
+                            kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO)
+                                .launch {
+                                    java.io.File(App.instance.downloader.modelsDir(), m.fileName)
+                                        .delete()
+                                    if (settings.localLlmId == m.id) settings.localLlmId = null
+                                    refresh++
+                                }
+                        }) { Icon(Icons.Filled.Delete, "Удалить модель") }
                     }
                 }
             }

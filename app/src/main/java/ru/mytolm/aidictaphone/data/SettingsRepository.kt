@@ -60,6 +60,14 @@ class SettingsRepository(context: Context) {
         _theme.value = mode
     }
 
+    /** Material You: цвета из обоев (аудит UX-1). По умолчанию включена. */
+    private val _dynamicTheme by lazy { MutableStateFlow(uiPrefs.getBoolean("dynamic_theme", true)) }
+    val dynamicTheme: StateFlow<Boolean> get() = _dynamicTheme.asStateFlow()
+    fun saveDynamicTheme(v: Boolean) {
+        uiPrefs.edit().putBoolean("dynamic_theme", v).apply()
+        _dynamicTheme.value = v
+    }
+
     private fun readLlm() = LlmSettings(
         baseUrl = prefs.getString("llm_base_url", "") ?: "",
         apiKey = prefs.getString("llm_api_key", "") ?: "",
@@ -139,14 +147,6 @@ class SettingsRepository(context: Context) {
         }
 
     fun setInferenceThreads(n: Int) { putInt("inference_threads", n) }
-
-    var diarizationEnabled: Boolean
-        get() = prefs.getBoolean("diarization", false)
-        set(v) = putBool("diarization", v)
-
-    var expectedSpeakers: Int
-        get() = prefs.getInt("expected_speakers", 2)
-        set(v) = putInt("expected_speakers", v)
 
     // ---- сам-тест CPU (Tensor pitfall, §2) ----
     var selfTestPassed: Boolean

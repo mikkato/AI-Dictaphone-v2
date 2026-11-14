@@ -29,56 +29,42 @@ import ru.mytolm.aidictaphone.data.App
 import ru.mytolm.aidictaphone.data.ModelRegistry
 import ru.mytolm.aidictaphone.data.ModelFamily
 import ru.mytolm.aidictaphone.data.WhisperModel
+import ru.mytolm.aidictaphone.voice.DlState
+import ru.mytolm.aidictaphone.voice.ModelDownloadWorker
+import ru.mytolm.aidictaphone.voice.ModelDownloads
 import java.io.File
-import java.util.concurrent.Executors
 
+/**
+ * Скачивание — только очередь WorkManager (ModelDownloadWorker): экран может
+ * закрыться, загрузка продолжится (аудит F3). VM наблюдает статус из
+ * [ModelDownloads], optimistically помечая «нажали Скачать» до старта воркера.
+ */
 class ModelViewModel(app: Application) : AndroidViewModel(app) {
-    val progress = mutableStateMapOf<String, Int>()      // modelId -> %
-    val downloading = mutableStateMapOf<String, Boolean>()
-    val errors = mutableStateMapOf<String, String>()
+    val dlState = ModelDownloads.state(app)
+    private val tapped = mutableStateMapOf<String, Boolean>()
+    val localErrors = mutableStateMapOf<String, String>()
     var customUrl by mutableStateOf(App.instance.settings.customModelUrl)
-
-    private val pool = Executors.newSingleThreadExecutor()
 
     fun installed(model: WhisperModel): Boolean =
         App.instance.downloader.installed(model)
 
+    fun busy(id: String, installed: Boolean, st: DlState?): Boolean =
+        (st?.running == true) || (tapped[id] == true && !installed && st?.error == null)
+
     fun startDownload(model: WhisperModel) {
-        if (downloading[model.id] == true) return
-        downloading[model.id] = true
-        errors.remove(model.id)
-        viewModelScope.launch {
-            try {
-                val result = withContext(Dispatchers.IO) {
-                    App.instance.downloader.download(
-                        model, customUrl.takeIf { it.isNotBlank() }) { ev ->
-                        when (ev) {
-                            is ru.mytolm.aidictaphone.data.DownloadEvent.Progress ->
-                                progress[model.id] =
-                                    if (ev.total > 0) (100.0 * ev.downloaded / ev.total).toInt() else 0
-                            is ru.mytolm.aidictaphone.data.DownloadEvent.Failed ->
-                                errors[model.id] = ev.message
-                            else -> {}
-                        }
-                    }
-                }
-                result.onFailure { errors[model.id] = it.message ?: "Ошибка загрузки" }
-            } finally {
-                downloading[model.id] = false
-            }
-        }
+        if (tapped[model.id] == true) return
+        tapped[model.id] = true
+        localErrors.remove(model.id)
+        ModelDownloadWorker.enqueue(getApplication(), model.id, isLlm = false,
+            customUrl.takeIf { it.isNotBlank() })
     }
 
-    fun importFrom(localPath: String): String? {
-        // SAF-файл модели: читается напрямую без повторного скачивания (ТЗ §3)
-        val src = File(localPath)
-        if (!src.exists() || src.length() < 1_000_000)
-            return "Файл не найден или слишком мал для модели GGML"
-        App.instance.settings.whisperModelFile = src.absolutePath
-        App.instance.settings.asrKind = ModelRegistry.KIND_WHISPER
-        App.instance.settings.activeModelId = "custom"
-        return null
+    fun cancelDownload(model: WhisperModel) {
+        tapped.remove(model.id)
+        ModelDownloadWorker.cancel(getApplication(), model.id)
     }
+
+    fun onDone(id: String) { tapped.remove(id) }
 
     fun useModel(model: WhisperModel) {
         val s = App.instance.settings
@@ -106,6 +92,29 @@ class ModelViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
     }
+
+    /** Импорт своей модели из SAF: viewModelScope + Dispatchers.IO (аудит F16 — без «ничейной» корутины). */
+    fun importFromUri(context: android.content.Context, uri: android.net.Uri, onDone: () -> Unit) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val dir = App.instance.downloader.modelsDir()
+                val name = uri.lastPathSegment?.substringAfterLast('/') ?: "custom_model.bin"
+                val target = File(dir, name)
+                context.contentResolver.openInputStream(uri)?.use { input ->
+                    target.outputStream().use { input.copyTo(it) }
+                }
+                App.instance.settings.whisperModelFile = target.absolutePath
+                App.instance.settings.asrKind = ModelRegistry.KIND_WHISPER
+                App.instance.settings.activeModelId = "custom"
+                withContext(Dispatchers.Main) { onDone() }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    android.widget.Toast.makeText(context,
+                        "Импорт модели: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
 }
 
 private fun fmtSize(b: Long): String =
@@ -119,6 +128,7 @@ fun ModelScreen(onBack: () -> Unit) {
     val context = LocalContext.current
     var refresh by remember { mutableIntStateOf(0) }
     val activeId = App.instance.settings.activeModelId
+    val dl by vm.dlState.collectAsState()
 
     val safPicker = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
@@ -126,13 +136,15 @@ fun ModelScreen(onBack: () -> Unit) {
         uri ?: return@rememberLauncherForActivityResult
         context.contentResolver.takePersistableUriPermission(
             uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        importModelFromUri(context, uri, onDone = { refresh++ })
+        vm.importFromUri(context, uri, onDone = { refresh++ })
     }
 
     Scaffold(topBar = {
         TopAppBar(
             navigationIcon = {
-                IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Назад") }
+                IconButton(onClick = onBack) {
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, "Назад")
+                }
             },
             title = { Text("Модели распознавания") },
             colors = TopAppBarDefaults.topAppBarColors(
@@ -142,12 +154,13 @@ fun ModelScreen(onBack: () -> Unit) {
             .padding(20.dp)) {
 
             Text("Модели скачиваются один раз и хранятся в папке приложения — аудио никуда " +
-                 "не отправляется. Выберите семейство и квант (размер/точность).",
+                 "не отправляется. Выберите семейство и квант (размер/точность). Загрузка " +
+                 "продолжается в фоне, можно закрыть экран.",
                 fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(16.dp))
 
             ModelRegistry.FAMILIES.forEach { fam ->
-                FamilyCard(vm, fam, activeId, refresh)
+                FamilyCard(vm, fam, activeId, refresh, dl)
             }
 
             Spacer(Modifier.height(8.dp))
@@ -155,7 +168,7 @@ fun ModelScreen(onBack: () -> Unit) {
                 safPicker.launch(arrayOf("*/*"))
             }) {
                 Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Filled.FolderOpen, null)
+                    Icon(Icons.Filled.FolderOpen, "Импорт модели из файла")
                     Spacer(Modifier.width(12.dp))
                     Column(Modifier.weight(1f)) {
                         Text("Выбрать свою модель (SAF)", fontWeight = FontWeight.Medium)
@@ -189,6 +202,7 @@ private fun FamilyCard(
     fam: ModelFamily,
     activeId: String?,
     refresh: Int,
+    dl: Map<String, DlState>,
 ) {
     var sel by remember(fam.id) {
         mutableStateOf(fam.quants.firstOrNull { it.id == activeId } ?: fam.quants.firstOrNull())
@@ -226,17 +240,25 @@ private fun FamilyCard(
             }
 
             sel?.let { m ->
-                QuantRow(vm, m, activeId == m.id, refresh)
+                QuantRow(vm, m, activeId == m.id, refresh, dl[m.id])
             }
         }
     }
 }
 
 @Composable
-private fun QuantRow(vm: ModelViewModel, m: WhisperModel, selected: Boolean, refresh: Int) {
+private fun QuantRow(
+    vm: ModelViewModel,
+    m: WhisperModel,
+    selected: Boolean,
+    refresh: Int,
+    st: DlState?,
+) {
     val present = vm.installed(m)
-    val isDownloading = vm.downloading[m.id] == true
-    val pct = vm.progress[m.id] ?: 0
+    if (present) vm.onDone(m.id)
+    val isDownloading = vm.busy(m.id, present, st)
+    val pct = st?.percent ?: 0
+    val err = vm.localErrors[m.id] ?: st?.error
 
     if (isDownloading) {
         Spacer(Modifier.height(8.dp))
@@ -244,12 +266,15 @@ private fun QuantRow(vm: ModelViewModel, m: WhisperModel, selected: Boolean, ref
         Text("$pct% — возобновляется после обрыва", fontSize = 11.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
-    vm.errors[m.id]?.let { err ->
+    if (!isDownloading && err != null) {
         Spacer(Modifier.height(6.dp))
         Text(err, fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
     }
     Spacer(Modifier.height(8.dp))
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+        if (!present && isDownloading) {
+            OutlinedButton(onClick = { vm.cancelDownload(m) }) { Text("Отменить") }
+        }
         if (!present && !isDownloading) {
             Button(onClick = { vm.startDownload(m) }) { Text("Скачать ${fmtSize(m.sizeBytes)}") }
         }
@@ -260,35 +285,9 @@ private fun QuantRow(vm: ModelViewModel, m: WhisperModel, selected: Boolean, ref
                 Button(onClick = { vm.useModel(m) }) { Text("Использовать") }
             }
             OutlinedIconButton(onClick = { vm.deleteModel(m) }) {
-                Icon(Icons.Filled.Delete, "Удалить")
+                Icon(Icons.Filled.Delete, "Удалить модель")
             }
         }
         Text(m.label, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-    }
-}
-
-private fun importModelFromUri(
-    context: android.content.Context,
-    uri: android.net.Uri,
-    onDone: () -> Unit,
-) {
-    kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
-        try {
-            val dir = App.instance.downloader.modelsDir()
-            val name = uri.lastPathSegment?.substringAfterLast('/') ?: "custom_model.bin"
-            val target = File(dir, name)
-            context.contentResolver.openInputStream(uri)?.use { input ->
-                target.outputStream().use { input.copyTo(it) }
-            }
-            App.instance.settings.whisperModelFile = target.absolutePath
-            App.instance.settings.asrKind = ModelRegistry.KIND_WHISPER
-            App.instance.settings.activeModelId = "custom"
-            withContext(Dispatchers.Main) { onDone() }
-        } catch (e: Exception) {
-            withContext(Dispatchers.Main) {
-                android.widget.Toast.makeText(context,
-                    "Импорт модели: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
-            }
-        }
     }
 }

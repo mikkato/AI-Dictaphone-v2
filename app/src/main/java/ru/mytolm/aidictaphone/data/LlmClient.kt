@@ -36,11 +36,9 @@ class LlmClient(private val settings: SettingsRepository) {
             val req = Request.Builder().url(url)
                 .header("Authorization", "Bearer ${s.apiKey}").get().build()
             client.newCall(req).execute().use { resp ->
-                android.util.Log.i("LlmTest", "GET $url -> ${resp.code}")
                 if (resp.isSuccessful) {
                     Result.success("Подключение успешно")
                 } else if (resp.code == 404 || resp.code == 401 || resp.code == 403) {
-                    android.util.Log.i("LlmTest", "fallback chat; keylen=${s.apiKey.length}")
                     // некоторые эндпоинты не отдают /models — пробуем chat
                     chatOnce("Скажи одно слово: ок", maxTokens = 8)
                 } else {

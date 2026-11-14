@@ -17,3 +17,10 @@
 
 # Точка входа Application/Activity держат manifest-правила AGP; Room-код
 # генерируется KSP и ссылается на сущности напрямую — extra keeps не нужны.
+
+# release: вырезать отладочные логи целиком (v/d/i; warn/error остаются)
+-assumenosideeffects class android.util.Log {
+    public static int v(...);
+    public static int d(...);
+    public static int i(...);
+}

@@ -24,8 +24,8 @@ android {
         applicationId = "ru.mytolm.aidictaphone"
         minSdk = 35
         targetSdk = 36
-        versionCode = 9
-        versionName = "3.0.1"
+        versionCode = 10
+        versionName = "3.0.2"
         ndk {
             // Только arm64: все целевые телефоны и эмулятор на Apple Silicon — arm64.
             // x86_64 удваивал вес нативных библиотек (whisper+llama+onnx).

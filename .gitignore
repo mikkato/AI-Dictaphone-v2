@@ -17,3 +17,6 @@ release.jks
 .idea/
 *.iml
 .DS_Store
+
+# подписи
+/tools/.secrets/

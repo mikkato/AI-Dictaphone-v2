@@ -67,8 +67,15 @@ class LocalLlmClient(private val context: Context) {
                 }
                 partials.joinToString("\n\n")
             }
-            val finalText = LlamaEngine.chat(system, finalInput, 1024, temp)
-            onToken.onToken(finalText)
+            // финальная генерация стримится через PieceCallback (аудит F18):
+            // UI печатает по ходу, а не ждёт всю генерацию
+            var streamedAny = false
+            val finalText = LlamaEngine.chat(system, finalInput, 1024, temp,
+                onPiece = { piece ->
+                    streamedAny = true
+                    onToken.onToken(piece)
+                })
+            if (!streamedAny && finalText.isNotEmpty()) onToken.onToken(finalText)
             // Qwen3 «thinking»: отрежем размышления до ответа
             val cleaned = finalText.substringAfterLast("</think>").ifBlank { finalText }
                 .trim()

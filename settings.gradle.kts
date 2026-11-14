@@ -12,5 +12,5 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "AI-Dictaphone"
+rootProject.name = "Smart-Rec"
 include(":app")

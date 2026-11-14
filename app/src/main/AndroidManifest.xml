@@ -15,6 +15,7 @@
         android:name=".data.App"
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:theme="@style/Theme.Dictaphone">
@@ -39,6 +40,11 @@
             android:name="androidx.work.impl.foreground.SystemForegroundService"
             android:foregroundServiceType="dataSync"
             tools:node="merge" />
+
+        <!-- «Отмена» в нотификации загрузки модели -->
+        <receiver
+            android:name=".voice.CancelDownloadReceiver"
+            android:exported="false" />
 
         <provider
             android:name="androidx.core.content.FileProvider"

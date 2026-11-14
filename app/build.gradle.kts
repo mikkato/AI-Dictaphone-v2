@@ -1,10 +1,10 @@
 import java.util.Properties
 
 plugins {
-    id("com.android.application")
-    id("org.jetbrains.kotlin.android")
-    id("org.jetbrains.kotlin.plugin.compose")
-    id("com.google.devtools.ksp")
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.ksp)
 }
 
 // Прод-подпись: keystore.properties + release.jks в корне проекта.
@@ -17,13 +17,15 @@ val keystoreProps = Properties().apply {
 android {
     namespace = "ru.mytolm.aidictaphone"
     compileSdk = 36
+    // NDK 28.2 уже установлен в SDK; без пина AGP тянет свой 27.0 (~1 ГБ)
+    ndkVersion = "28.2.13676358"
 
     defaultConfig {
         applicationId = "ru.mytolm.aidictaphone"
         minSdk = 35
         targetSdk = 36
-        versionCode = 7
-        versionName = "2.1.2"
+        versionCode = 8
+        versionName = "3.0.0"
         ndk {
             // Только arm64: все целевые телефоны и эмулятор на Apple Silicon — arm64.
             // x86_64 удваивал вес нативных библиотек (whisper+llama+onnx).
@@ -107,30 +109,36 @@ android {
 }
 
 dependencies {
-    val composeBom = platform("androidx.compose:compose-bom:2024.10.01")
+    val composeBom = platform(libs.compose.bom)
     implementation(composeBom)
     implementation(files("libs/sherpa-onnx-2.0.1.aar"))
-    implementation("androidx.core:core-ktx:1.15.0")
-    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
-    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
-    implementation("androidx.activity:activity-compose:1.9.3")
-    implementation("androidx.compose.ui:ui")
-    implementation("androidx.compose.material3:material3")
-    implementation("androidx.compose.material:material-icons-extended")
-    implementation("androidx.navigation:navigation-compose:2.8.4")
+    implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.viewmodel.compose)
+    implementation(libs.androidx.activity.compose)
+    implementation(libs.compose.ui)
+    implementation(libs.compose.material3)
+    implementation(libs.compose.material.icons.extended)
+    implementation(libs.androidx.navigation.compose)
 
-    implementation("androidx.media3:media3-exoplayer:1.4.1")
+    implementation(libs.androidx.media3.exoplayer)
 
-    implementation("androidx.room:room-runtime:2.6.1")
-    implementation("androidx.room:room-ktx:2.6.1")
-    ksp("androidx.room:room-compiler:2.6.1")
+    implementation(libs.androidx.room.runtime)
+    implementation(libs.androidx.room.ktx)
+    ksp(libs.androidx.room.compiler)
 
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
-    implementation("androidx.work:work-runtime-ktx:2.10.1")
-    implementation("androidx.security:security-crypto:1.1.0-alpha06")
+    implementation(libs.okhttp)
+    implementation(libs.kotlinx.serialization.json)
+    implementation(libs.androidx.work.runtime.ktx)
+    implementation(libs.androidx.security.crypto)
 
-    testImplementation("junit:junit:4.13.2")
-    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
+    testImplementation(libs.junit)
+    testImplementation(libs.kotlinx.coroutines.test)
     androidTestImplementation(composeBom)
+}
+
+// Room: экспортируем схему при сборке — с v3 начинается история миграций
+// (без неё следующий bump версии физически нечем описать)
+ksp {
+    arg("room.schemaLocation", "$projectDir/schemas")
 }

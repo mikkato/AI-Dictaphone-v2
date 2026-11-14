@@ -11,6 +11,12 @@
 Ранее проект назывался «AI-Диктофон» (AI-Dictaphone v2); с версии 3.0.0 — **Smart Rec**.
 Название пакета и git-удалённый репозиторий от переименования не зависят.
 
+## Релизы
+
+[Releases](../../releases) — arm64-v8a APK, прод-подпись (CN=Smart Rec,
+`tools/.secrets/`, gitignored). Журнал изменений — [CHANGELOG.md](CHANGELOG.md).
+Модели (GGUF/ONNX) в APK не входят — скачиваются в приложении.
+
 ## Сборка
 
 Требования: JDK 21, Android SDK (compileSdk 36), NDK, CMake 3.22+.

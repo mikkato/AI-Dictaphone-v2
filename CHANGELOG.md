@@ -1,9 +1,20 @@
 # Smart Rec — журнал релизов
 
+## 3.0.2 (vc 10) — гигиена релиза
+Убран тест-лог `LlmTest` (писал в logcat URL LLM-эндпоинта и длину API-ключа).
+R8 `assumenosideeffects`: `Log.v/d/i` вырезаются из release-кода (warn/error остаются).
+
+## 3.0.1 (vc 9) — фикс краха при загрузке моделей
+`InvalidForegroundServiceTypeException` на Android 14+: `ModelDownloadWorker`
+строил `ForegroundInfo` без типа FGS — система убивала процесс при старте
+загрузки, а WorkManager повторял крах при каждом запуске (задача в очереди).
+Теперь тип `dataSync` указывается явно (как уже делал `TranscriptionWorker`).
+Скачанное возобновляется с обрыва.
+
 ## 3.0.0 (vc 8) — переименование и модернизация по аудиту
 Проект переименован: **AI-Диктофон → Smart Rec** (label, README, root project;
 `applicationId`/пакет `ru.mytolm.aidictaphone` не менялись). Новая адаптивная
-иконка: waveform-микрофон на фоне #1E1B2E + монослой для themed icons.
+иконка: красный круг записи с микросхемой (без текста) + монослой для themed icons.
 
 ### Сделано по итогам аудита (v2-AUDIT)
 - НЕПОТЕРЯ записи: заметка создаётся в начале записи, WAV-заголовок дописывается

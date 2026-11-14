@@ -105,7 +105,9 @@ class ModelDownloadWorker(context: Context, params: WorkerParameters) :
 
         createChannel()
         setForeground(ForegroundInfo(notifId(modelId),
-            buildNotification(modelId, model.fileName, 0)))
+            buildNotification(modelId, model.fileName, 0),
+            // targetSdk 36: тип FGS обязателен явно, иначе InvalidForegroundServiceTypeException
+            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC))
         setProgressAsync(workDataOf("modelId" to modelId, "percent" to 0))
 
         var lastPct = -1
@@ -181,7 +183,8 @@ class ModelDownloadWorker(context: Context, params: WorkerParameters) :
 
     override suspend fun getForegroundInfo(): ForegroundInfo {
         val modelId = inputData.getString("modelId") ?: "model"
-        return ForegroundInfo(notifId(modelId), buildNotification(modelId, modelId, 0))
+        return ForegroundInfo(notifId(modelId), buildNotification(modelId, modelId, 0),
+            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
     }
 }
 

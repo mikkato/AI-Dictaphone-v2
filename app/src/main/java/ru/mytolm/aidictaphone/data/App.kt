@@ -40,6 +40,21 @@ class App : Application() {
         WorkManager.initialize(this, androidx.work.Configuration.Builder().build())
     }
 
+    /**
+     * Реакция на давление памяти (аудит S5): при нехватке RAM резидентная
+     * модель (до 2.5 ГБ) выгружается, пока операция не идёт.
+     */
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= TRIM_MEMORY_RUNNING_LOW)
+            ru.mytolm.aidictaphone.voice.ModelManager.unloadIfIdle()
+    }
+
+    override fun onLowMemory() {
+        super.onLowMemory()
+        ru.mytolm.aidictaphone.voice.ModelManager.unloadIfIdle()
+    }
+
     companion object {
         lateinit var instance: App
             private set

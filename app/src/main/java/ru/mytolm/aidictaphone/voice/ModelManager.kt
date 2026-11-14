@@ -2,16 +2,27 @@ package ru.mytolm.aidictaphone.voice
 
 import android.app.ActivityManager
 import android.content.Context
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 /**
  * Арбитраж больших моделей в RAM (защита от OOM): одновременно резидентна
  * только одна тяжёлая модель. Вход операции выгружает чужую, informer читает состояние.
+ * Простой резидента ограничен таймаутом (аудит S6) и система может потребовать
+ * полную выгрузку через onTrimMemory (аудит S5) — см. [unloadIfIdle].
  */
 object ModelManager {
 
     enum class Resident { NONE, ASR, LLM }
+
+    /** Авто-выгрузка резидента после простоя (аудит S6): 3 минуты. */
+    private const val IDLE_UNLOAD_MS = 3 * 60_000L
 
     @Volatile var resident: Resident = Resident.NONE
         private set
@@ -21,11 +32,14 @@ object ModelManager {
         private set
 
     private val opMutex = Mutex()
+    private val timerScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var unloadTimer: Job? = null
 
     /** Вход транскрипции: выгружает LLM, делает ASR резидентом. */
     suspend fun enterAsr(name: String) { opMutex.withLock {
         if (resident == Resident.LLM) LlamaEngine.unload()
         resident = Resident.ASR; residentName = name
+        cancelIdleTimer()
     } }
 
     suspend fun <T> asrOperation(name: String, block: suspend () -> T): T = opMutex.withLock {
@@ -34,8 +48,11 @@ object ModelManager {
         }
         resident = Resident.ASR
         residentName = name
+        cancelIdleTimer()
         try { block() } finally {
-            // после операции ASR держим: транскрипции обычно идут пачками (очередь импорта)
+            // после операции держим резидент (транскрипции идут пачками), но
+            // недолго: по таймауту простоим — выгрузим (аудит S6)
+            scheduleIdleUnload()
         }
     }
 
@@ -46,7 +63,32 @@ object ModelManager {
         }
         resident = Resident.LLM
         residentName = name
-        try { block() } finally { }
+        cancelIdleTimer()
+        try { block() } finally { scheduleIdleUnload() }
+    }
+
+    fun cancelIdleTimer() { unloadTimer?.cancel(); unloadTimer = null }
+
+    /** Резидент по-прежнему нужен? Нет — через IDLE_UNLOAD_MS без операций выгрузим. */
+    fun scheduleIdleUnload() {
+        unloadTimer?.cancel()
+        unloadTimer = timerScope.launch {
+            delay(IDLE_UNLOAD_MS)
+            // если за это время началась операция — не трогаем
+            if (opMutex.isLocked) return@launch
+            unloadAll()
+        }
+    }
+
+    /**
+     * Выгрузка без ожидания операции (вызывается из onTrimMemory): если тяжёлая
+     * операция идёт прямо сейчас — пропускаем (прерывать инференс посреди чанка
+     * опаснее, чем получить TRIM: система убьёт процесс только при CRITICAL).
+     */
+    fun unloadIfIdle() {
+        if (resident == Resident.NONE) return
+        if (opMutex.isLocked) return
+        unloadAll()
     }
 
     /** Полная разгрузка (по требованию пользователя / нехватке памяти). */

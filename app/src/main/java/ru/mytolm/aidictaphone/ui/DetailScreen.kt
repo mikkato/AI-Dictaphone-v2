@@ -80,6 +80,10 @@ class DetailViewModel(app: Application) : AndroidViewModel(app) {
     var selectedTemplate by mutableStateOf("protocol")
     var detailedStyle by mutableStateOf(false)
 
+    // active summarize job — для кнопки «Отмена» (аудит U10)
+    private var summarizeJob: kotlinx.coroutines.Job? = null
+    @Volatile private var summarizeCancelledByUser = false
+
     fun bind(id: Long) {
         if (noteId == id) return
         noteId = id
@@ -173,6 +177,7 @@ class DetailViewModel(app: Application) : AndroidViewModel(app) {
         summaryProgress.value = 0f
         summaryStreaming.value = true
         summaryStreamText.value = ""
+        summarizeCancelledByUser = false
         val modelName = if (App.instance.settings.summarizeMode == "local" &&
                 App.instance.localLlmClient.modelFile() != null)
             "local:" + (App.instance.settings.localLlmId ?: "gguf")
@@ -186,7 +191,7 @@ class DetailViewModel(app: Application) : AndroidViewModel(app) {
                 if (prev != null && prev >= streamFrac) prev else streamFrac
             }
         }
-        viewModelScope.launch {
+        summarizeJob = viewModelScope.launch {
             try {
                 val full = buildTranscriptForLlm()
                 val localReady = App.instance.settings.summarizeMode == "local" &&
@@ -225,7 +230,12 @@ class DetailViewModel(app: Application) : AndroidViewModel(app) {
                 Notifier.summaryDone(getApplication(), noteId, note.value?.title ?: "Заметка")
             } catch (e: Exception) {
                 android.util.Log.e("SummErr", "summarize failed", e)
-                summaryError.value = e.message ?: ("Ошибка суммаризации: " + e.javaClass.simpleName)
+                val userCancelled = summarizeCancelledByUser ||
+                    e is kotlinx.coroutines.CancellationException
+                if (!userCancelled) {
+                    summaryError.value = e.message
+                        ?: ("Ошибка суммаризации: " + e.javaClass.simpleName)
+                }
                 if (summaryStreamText.value.isNotBlank()) { // частичный ответ сохраняется (§6)
                     App.instance.dao.insertSummary(SummaryVersion(
                         noteId = noteId, style = "partial",
@@ -233,11 +243,35 @@ class DetailViewModel(app: Application) : AndroidViewModel(app) {
                         model = modelName,
                         text = summaryStreamText.value))
                 }
-                Notifier.summaryFailed(getApplication(), noteId,
-                    e.message ?: "Ошибка суммаризации")
+                if (!userCancelled) {
+                    Notifier.summaryFailed(getApplication(), noteId,
+                        e.message ?: "Ошибка суммаризации")
+                }
             } finally {
                 summaryStreaming.value = false
             }
+        }
+    }
+
+    /** Отмена генерации саммари (аудит U10): job + нативная остановка локального чата. */
+    fun cancelSummary() {
+        if (!summaryStreaming.value) return
+        summarizeCancelledByUser = true
+        summarizeJob?.cancel()
+        summarizeJob = null
+        runCatching { ru.mytolm.aidictaphone.voice.LlamaEngine.cancelGeneration() }
+        summaryStage.value = "Отменено"
+        summaryStreaming.value = false
+    }
+
+    /** Отмена транскрибации заметки (аудит U11). */
+    fun cancelTranscribe() {
+        TranscriptionWorker.cancel(getApplication(), noteId)
+        viewModelScope.launch {
+            // если воркер ещё не стартовал — статус сам уйдёт из QUEUED в AUDIO
+            val n = App.instance.dao.note(noteId)
+            if (n != null && n.status == NoteStatus.QUEUED)
+                App.instance.dao.setNoteStatus(noteId, NoteStatus.AUDIO, prog = 0)
         }
     }
 
@@ -554,6 +588,16 @@ private fun TranscriptTab(
             if (note?.status == NoteStatus.TRANSCRIBING) {
                 Spacer(Modifier.height(12.dp))
                 LinearProgressIndicator(progress = { (note?.transcriptProgress ?: 0) / 100f })
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(onClick = { vm.cancelTranscribe() }) {
+                    Text("Отменить транскрибацию")
+                }
+            }
+            if (note?.status == NoteStatus.QUEUED) {
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(onClick = { vm.cancelTranscribe() }) {
+                    Text("Отменить очередь")
+                }
             }
         }
         return
@@ -584,15 +628,14 @@ private fun TranscriptTab(
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Spacer(Modifier.weight(1f))
                     if (seg.speakerId > 0) {
-                        IconButton(onClick = { onRename(seg.speakerId) },
-                            modifier = Modifier.size(28.dp)) {
-                            Icon(Icons.Filled.Person, null, Modifier.size(14.dp),
+                        IconButton(onClick = { onRename(seg.speakerId) }) {
+                            Icon(Icons.Filled.Person, "Изменить имя спикера",
+                                Modifier.size(14.dp),
                                 tint = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     }
-                    IconButton(onClick = { onEdit(seg) },
-                        modifier = Modifier.size(28.dp)) {
-                        Icon(Icons.Filled.Edit, null, Modifier.size(14.dp),
+                    IconButton(onClick = { onEdit(seg) }) {
+                        Icon(Icons.Filled.Edit, "Редактировать сегмент", Modifier.size(14.dp),
                             tint = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
@@ -684,6 +727,13 @@ private fun SummaryTab(
                             Modifier.fillMaxWidth().height(8.dp)
                                 .clip(RoundedCornerShape(4.dp)))
                     }
+                    // «Отмена» генерации (аудит U10): локальная генерация может идти минуты
+                    Row(Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End) {
+                        TextButton(onClick = { vm.cancelSummary() }) {
+                            Text("Отменить генерацию")
+                        }
+                    }
                     if (streamText.isNotEmpty()) {
                         Spacer(Modifier.height(6.dp))
                         Text("Отпечатано ${streamText.length} символов",
@@ -757,7 +807,7 @@ private fun HighlightsTab(vm: DetailViewModel, highlights: List<Highlight>) {
                 color = MaterialTheme.colorScheme.surface,
                 modifier = Modifier.fillMaxWidth().clickable { vm.seekTo(h.timeMs) }) {
                 Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Filled.Bookmark, null, Modifier.size(18.dp),
+                    Icon(Icons.Filled.Bookmark, "Момент", Modifier.size(18.dp),
                         tint = MaterialTheme.colorScheme.secondary)
                     Spacer(Modifier.width(10.dp))
                     Text(TimeFmt.clock(h.timeMs), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
@@ -799,7 +849,8 @@ private fun PlayerBar(vm: DetailViewModel, p: PlayerUi) {
                         .clickable { vm.togglePlay() },
                     contentAlignment = Alignment.Center) {
                     Icon(if (p.playing) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                        null, tint = MaterialTheme.colorScheme.onPrimary,
+                        if (p.playing) "Пауза" else "Воспроизвести",
+                        tint = MaterialTheme.colorScheme.onPrimary,
                         modifier = Modifier.size(30.dp))
                 }
                 Spacer(Modifier.width(14.dp))

@@ -62,4 +62,9 @@ object LlamaEngine {
             handle = 0L
         }
     }
+
+    /** Прервать текущую генерацию (безопасно звать из UI, пока chat блокирует IO-поток). */
+    fun cancelGeneration() = requestCancelNative()
+
+    private external fun requestCancelNative()
 }

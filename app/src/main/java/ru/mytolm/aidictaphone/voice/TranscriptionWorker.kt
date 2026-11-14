@@ -78,7 +78,12 @@ class TranscriptionWorker(context: Context, params: WorkerParameters) :
                                 buildNotification(percent))
                     }
                 }
+                // отмена WorkManager (кнопка «Отменить») → engine прерывает
+                // инференс через whisper progress_callback (аудит F6)
+                override fun isCancelled(): Boolean = isStopped
             })
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e   // статус уже выставлен мягким catch'ем движка
         } catch (e: Exception) {
             dao.setNoteStatus(noteId, NoteStatus.ERROR, e.message)
         }

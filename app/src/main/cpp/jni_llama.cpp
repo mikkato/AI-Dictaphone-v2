@@ -1,6 +1,7 @@
 // JNI-мост к llama.cpp (статический ggml-CPU). Экспортирует только Java_* символы.
 #include <jni.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <string>
 #include <vector>
@@ -12,6 +13,16 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  "LlamaJNI", __VA_ARGS__)
 
 struct LlamaHandle { llama_model *m; llama_context *c; };
+
+// Отмена генерации (аудит U10/F6): UI дёргает requestCancel, чат-циклы
+// (prefill и генерация) проверяют флаг и выходят с частичным результатом.
+static std::atomic<bool> g_cancel{false};
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_ru_mytolm_aidictaphone_voice_LlamaEngine_requestCancelNative(JNIEnv *, jclass) {
+    g_cancel.store(true);
+}
 
 extern "C"
 JNIEXPORT jlong JNICALL
@@ -60,6 +71,7 @@ Java_ru_mytolm_aidictaphone_voice_LlamaEngine_chatNative(JNIEnv *env, jclass, jl
     auto *h = (LlamaHandle *) (uintptr_t) handle;
     const int max_tokens = (int) max_tokens_f;
     const llama_vocab *vocab = llama_model_get_vocab(h->m);
+    g_cancel.store(false);   // новый чат — сбросить флаг отмены
 
     const char *sys = env->GetStringUTFChars(system_, nullptr);
     const char *usr = env->GetStringUTFChars(user_, nullptr);
@@ -112,6 +124,11 @@ Java_ru_mytolm_aidictaphone_voice_LlamaEngine_chatNative(JNIEnv *env, jclass, jl
     // prefill окнами по n_batch
     size_t i = 0;
     while (i < toks.size()) {
+        if (g_cancel.load()) {
+            LOGI("cancelled during prefill");
+            llama_sampler_free(smpl);
+            return env->NewStringUTF("");
+        }
         int take = (int) std::min<size_t>(toks.size() - i, 512);
         llama_batch batch = llama_batch_get_one(&toks[i], take);
         if (llama_decode(h->c, batch) != 0) {
@@ -132,6 +149,7 @@ Java_ru_mytolm_aidictaphone_voice_LlamaEngine_chatNative(JNIEnv *env, jclass, jl
     llama_sampler_accept(smpl, tok);
     for (int generated = 0; generated < max_tokens; generated++) {
         if (llama_vocab_is_eog(vocab, tok)) break;
+        if (g_cancel.load()) { LOGI("cancelled by request at tok %d", generated); break; }
         int plen = llama_token_to_piece(vocab, tok, piece, sizeof(piece), 0, true);
         if (plen > 0) {
             out.append(piece, plen);

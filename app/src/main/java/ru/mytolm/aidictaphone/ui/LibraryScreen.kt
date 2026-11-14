@@ -75,6 +75,15 @@ class LibraryViewModel(app: Application) : androidx.lifecycle.AndroidViewModel(a
         dao.clearSegments(note.id)
         TranscriptionWorker.schedule(getApplication(), note.id)
     }
+
+    fun cancelTranscribe(note: Note) {
+        TranscriptionWorker.cancel(getApplication(), note.id)
+        viewModelScope.launch {
+            val n = dao.note(note.id)
+            if (n != null && n.status == NoteStatus.QUEUED)
+                dao.setNoteStatus(note.id, NoteStatus.AUDIO, prog = 0)
+        }
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -199,7 +208,8 @@ fun LibraryScreen(
                     NoteCard(note,
                         onClick = { onOpen(note.id) },
                         onDelete = { vm.delete(note) },
-                        onRetry = { vm.retryTranscribe(note) })
+                        onRetry = { vm.retryTranscribe(note) },
+                        onCancelTranscribe = { vm.cancelTranscribe(note) })
                 }
             }
         }
@@ -207,7 +217,8 @@ fun LibraryScreen(
 }
 
 @Composable
-private fun NoteCard(note: Note, onClick: () -> Unit, onDelete: () -> Unit, onRetry: () -> Unit) {
+private fun NoteCard(note: Note, onClick: () -> Unit, onDelete: () -> Unit, onRetry: () -> Unit,
+                     onCancelTranscribe: () -> Unit) {
     val statusColor = when (note.status) {
         NoteStatus.ERROR -> MaterialTheme.colorScheme.error
         NoteStatus.READY -> Color(0xFF2E7D5B)
@@ -264,8 +275,12 @@ private fun NoteCard(note: Note, onClick: () -> Unit, onDelete: () -> Unit, onRe
                 if (note.status == NoteStatus.ERROR || note.status == NoteStatus.AUDIO) {
                     TextButton(onClick = onRetry) { Text("Транскрибировать") }
                 }
+                if (note.status == NoteStatus.TRANSCRIBING || note.status == NoteStatus.QUEUED) {
+                    // отмена из списка (аудит U11)
+                    TextButton(onClick = onCancelTranscribe) { Text("Отменить") }
+                }
                 TextButton(onClick = onDelete) {
-                    Icon(Icons.Filled.Delete, null, Modifier.size(16.dp))
+                    Icon(Icons.Filled.Delete, "Удалить заметку", Modifier.size(16.dp))
                     Spacer(Modifier.width(4.dp)); Text("Удалить")
                 }
             }
